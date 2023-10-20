@@ -1,15 +1,13 @@
 #!/usr/bin/env bash
 #
-# Copyright (c) 2018-2022 The Bitcoin Core developers
+# Copyright (c) 2018-present The Bitcoin Core developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 export LC_ALL=C.UTF-8
+export CI_IMAGE_LABEL="bitcoin-ci-test"
 
-export ASAN_OPTIONS="detect_stack_use_after_return=1:check_initialization_order=1:strict_init_order=1"
-export LSAN_OPTIONS="suppressions=${BASE_ROOT_DIR}/test/sanitizer_suppressions/lsan"
-export TSAN_OPTIONS="suppressions=${BASE_ROOT_DIR}/test/sanitizer_suppressions/tsan:halt_on_error=1:log_path=${BASE_SCRATCH_DIR}/sanitizer-output/tsan"
-export UBSAN_OPTIONS="suppressions=${BASE_ROOT_DIR}/test/sanitizer_suppressions/ubsan:print_stacktrace=1:halt_on_error=1:report_error_type=1"
+set -ex
 
 if [ -z "$DANGER_RUN_CI_ON_HOST" ]; then
   # Export all env vars to avoid missing some.
@@ -22,28 +20,38 @@ if [ -z "$DANGER_RUN_CI_ON_HOST" ]; then
       --file "${BASE_READ_ONLY_DIR}/ci/test_imagefile" \
       --build-arg "CI_IMAGE_NAME_TAG=${CI_IMAGE_NAME_TAG}" \
       --build-arg "FILE_ENV=${FILE_ENV}" \
+      --label="${CI_IMAGE_LABEL}" \
       --tag="${CONTAINER_NAME}" \
       "${BASE_READ_ONLY_DIR}"
   docker volume create "${CONTAINER_NAME}_ccache" || true
   docker volume create "${CONTAINER_NAME}_depends" || true
+  docker volume create "${CONTAINER_NAME}_depends_sources" || true
+  docker volume create "${CONTAINER_NAME}_depends_SDKs_android" || true
   docker volume create "${CONTAINER_NAME}_previous_releases" || true
 
   if [ -n "${RESTART_CI_DOCKER_BEFORE_RUN}" ] ; then
     echo "Restart docker before run to stop and clear all containers started with --rm"
-    podman container stop --all  # Similar to "systemctl restart docker"
+    podman container rm --force --all  # Similar to "systemctl restart docker"
+
+    # Still prune everything in case the filtered pruning doesn't work, or if labels were not set
+    # on a previous run. Belt and suspenders approach, should be fine to remove in the future.
     echo "Prune all dangling images"
     docker image prune --force
   fi
+  echo "Prune all dangling $CI_IMAGE_LABEL images"
+  docker image prune --force --filter "label=$CI_IMAGE_LABEL"
 
   # shellcheck disable=SC2086
-  CI_CONTAINER_ID=$(docker run $CI_CONTAINER_CAP --rm --interactive --detach --tty \
-                  --mount type=bind,src=$BASE_READ_ONLY_DIR,dst=/ro_base,readonly \
+  CI_CONTAINER_ID=$(docker run --cap-add LINUX_IMMUTABLE $CI_CONTAINER_CAP --rm --interactive --detach --tty \
+                  --mount "type=bind,src=$BASE_READ_ONLY_DIR,dst=$BASE_READ_ONLY_DIR,readonly" \
                   --mount "type=volume,src=${CONTAINER_NAME}_ccache,dst=$CCACHE_DIR" \
-                  --mount "type=volume,src=${CONTAINER_NAME}_depends,dst=$DEPENDS_DIR" \
+                  --mount "type=volume,src=${CONTAINER_NAME}_depends,dst=$DEPENDS_DIR/built" \
+                  --mount "type=volume,src=${CONTAINER_NAME}_depends_sources,dst=$DEPENDS_DIR/sources" \
+                  --mount "type=volume,src=${CONTAINER_NAME}_depends_SDKs_android,dst=$DEPENDS_DIR/SDKs/android" \
                   --mount "type=volume,src=${CONTAINER_NAME}_previous_releases,dst=$PREVIOUS_RELEASES_DIR" \
                   --env-file /tmp/env \
-                  --name $CONTAINER_NAME \
-                  $CONTAINER_NAME)
+                  --name "$CONTAINER_NAME" \
+                  "$CONTAINER_NAME")
   export CI_CONTAINER_ID
   export CI_EXEC_CMD_PREFIX="docker exec ${CI_CONTAINER_ID}"
 else
@@ -53,16 +61,29 @@ else
   mkdir -p "${PREVIOUS_RELEASES_DIR}"
 fi
 
+if [ "$CI_OS_NAME" == "macos" ]; then
+  IN_GETOPT_BIN="$(brew --prefix gnu-getopt)/bin/getopt"
+  export IN_GETOPT_BIN
+fi
+
 CI_EXEC () {
   $CI_EXEC_CMD_PREFIX bash -c "export PATH=${BINS_SCRATCH_DIR}:${BASE_ROOT_DIR}/ci/retry:\$PATH && cd \"${BASE_ROOT_DIR}\" && $*"
 }
 export -f CI_EXEC
 
-CI_EXEC rsync --archive --stats --human-readable /ci_base_install/ "${BASE_ROOT_DIR}" || echo "/ci_base_install/ missing"
+# Normalize all folders to BASE_ROOT_DIR
+CI_EXEC rsync --archive --stats --human-readable "${BASE_READ_ONLY_DIR}/" "${BASE_ROOT_DIR}" || echo "Nothing to copy from ${BASE_READ_ONLY_DIR}/"
 CI_EXEC "${BASE_ROOT_DIR}/ci/test/01_base_install.sh"
-CI_EXEC rsync --archive --stats --human-readable /ro_base/ "${BASE_ROOT_DIR}" || echo "Nothing to copy from ro_base"
+
 # Fixes permission issues when there is a container UID/GID mismatch with the owner
 # of the git source code directory.
 CI_EXEC git config --global --add safe.directory \"*\"
 
 CI_EXEC mkdir -p "${BINS_SCRATCH_DIR}"
+
+CI_EXEC "${BASE_ROOT_DIR}/ci/test/06_script_b.sh"
+
+if [ -z "$DANGER_RUN_CI_ON_HOST" ]; then
+  echo "Stop and remove CI container by ID"
+  docker container kill "${CI_CONTAINER_ID}"
+fi

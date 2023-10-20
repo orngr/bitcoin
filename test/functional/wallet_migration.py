@@ -6,7 +6,13 @@
 
 import random
 import shutil
+from test_framework.address import (
+    script_to_p2sh,
+    key_to_p2pkh,
+    key_to_p2wpkh,
+)
 from test_framework.descriptors import descsum_create
+from test_framework.key import ECPubKey
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.messages import COIN, CTransaction, CTxOut
 from test_framework.script_util import key_to_p2pkh_script, script_to_p2sh_script, script_to_p2wsh_script
@@ -134,12 +140,21 @@ class WalletMigrationTest(BitcoinTestFramework):
         self.generate(self.nodes[0], 1)
         bal = basic1.getbalance()
         txs = basic1.listtransactions()
+        addr_gps = basic1.listaddressgroupings()
 
-        basic1.migratewallet()
+        basic1_migrate = basic1.migratewallet()
         assert_equal(basic1.getwalletinfo()["descriptors"], True)
         self.assert_is_sqlite("basic1")
         assert_equal(basic1.getbalance(), bal)
         self.assert_list_txs_equal(basic1.listtransactions(), txs)
+
+        self.log.info("Test backup file can be successfully restored")
+        self.nodes[0].restorewallet("basic1_restored", basic1_migrate['backup_path'])
+        basic1_restored = self.nodes[0].get_wallet_rpc("basic1_restored")
+        basic1_restored_wi = basic1_restored.getwalletinfo()
+        assert_equal(basic1_restored_wi['balance'], bal)
+        assert_equal(basic1_restored.listaddressgroupings(), addr_gps)
+        self.assert_list_txs_equal(basic1_restored.listtransactions(), txs)
 
         # restart node and verify that everything is still there
         self.restart_node(0)
@@ -674,6 +689,21 @@ class WalletMigrationTest(BitcoinTestFramework):
         wallet.rpc.importaddress(address=script_wsh_pkh.hex(), label="raw_spk2", rescan=True, p2sh=False)
         assert_equal(wallet.getbalances()['watchonly']['trusted'], 5)
 
+        # Import sh(pkh()) script, by using importaddress(), with the p2sh flag enabled.
+        # This will wrap the script under another sh level, which is invalid!, and store it inside the wallet.
+        # The migration process must skip the invalid scripts and the addressbook records linked to them.
+        # They are not being watched by the current wallet, nor should be watched by the migrated one.
+        label_sh_pkh = "raw_sh_pkh"
+        script_pkh = key_to_p2pkh_script(df_wallet.getaddressinfo(df_wallet.getnewaddress())["pubkey"])
+        script_sh_pkh = script_to_p2sh_script(script_pkh)
+        addy_script_sh_pkh = script_to_p2sh(script_pkh)  # valid script address
+        addy_script_double_sh_pkh = script_to_p2sh(script_sh_pkh)  # invalid script address
+
+        # Note: 'importaddress()' will add two scripts, a valid one sh(pkh()) and an invalid one 'sh(sh(pkh()))'.
+        #       Both of them will be stored with the same addressbook label. And only the latter one should
+        #       be discarded during migration. The first one must be migrated.
+        wallet.rpc.importaddress(address=script_sh_pkh.hex(), label=label_sh_pkh, rescan=False, p2sh=True)
+
         # Migrate wallet and re-check balance
         info_migration = wallet.migratewallet()
         wallet_wo = self.nodes[0].get_wallet_rpc(info_migration["watchonly_name"])
@@ -683,10 +713,119 @@ class WalletMigrationTest(BitcoinTestFramework):
         # The watch-only scripts are no longer part of the main wallet
         assert_equal(wallet.getbalances()['mine']['trusted'], 0)
 
+        # The invalid sh(sh(pk())) script label must not be part of the main wallet anymore
+        assert label_sh_pkh not in wallet.listlabels()
+        # But, the standard sh(pkh()) script should be part of the watch-only wallet.
+        addrs_by_label = wallet_wo.getaddressesbylabel(label_sh_pkh)
+        assert addy_script_sh_pkh in addrs_by_label
+        assert addy_script_double_sh_pkh not in addrs_by_label
+
+        # Also, the watch-only wallet should have the descriptor for the standard sh(pkh())
+        desc = descsum_create(f"addr({addy_script_sh_pkh})")
+        assert next(it['desc'] for it in wallet_wo.listdescriptors()['descriptors'] if it['desc'] == desc)
+        # And doesn't have a descriptor for the invalid one
+        desc_invalid = descsum_create(f"addr({addy_script_double_sh_pkh})")
+        assert_equal(next((it['desc'] for it in wallet_wo.listdescriptors()['descriptors'] if it['desc'] == desc_invalid), None), None)
+
         # Just in case, also verify wallet restart
         self.nodes[0].unloadwallet(info_migration["watchonly_name"])
         self.nodes[0].loadwallet(info_migration["watchonly_name"])
         assert_equal(wallet_wo.getbalances()['mine']['trusted'], 5)
+
+    def test_conflict_txs(self):
+        self.log.info("Test migration when wallet contains conflicting transactions")
+        def_wallet = self.nodes[0].get_wallet_rpc(self.default_wallet_name)
+
+        wallet = self.create_legacy_wallet("conflicts")
+        def_wallet.sendtoaddress(wallet.getnewaddress(), 10)
+        self.generate(self.nodes[0], 1)
+
+        # parent tx
+        parent_txid = wallet.sendtoaddress(wallet.getnewaddress(), 9)
+        parent_txid_bytes = bytes.fromhex(parent_txid)[::-1]
+        conflict_utxo = wallet.gettransaction(txid=parent_txid, verbose=True)["decoded"]["vin"][0]
+
+        # The specific assertion in MarkConflicted being tested requires that the parent tx is already loaded
+        # by the time the child tx is loaded. Since transactions end up being loaded in txid order due to how both
+        # and sqlite store things, we can just grind the child tx until it has a txid that is greater than the parent's.
+        locktime = 500000000 # Use locktime as nonce, starting at unix timestamp minimum
+        addr = wallet.getnewaddress()
+        while True:
+            child_send_res = wallet.send(outputs=[{addr: 8}], add_to_wallet=False, locktime=locktime)
+            child_txid = child_send_res["txid"]
+            child_txid_bytes = bytes.fromhex(child_txid)[::-1]
+            if (child_txid_bytes > parent_txid_bytes):
+                wallet.sendrawtransaction(child_send_res["hex"])
+                break
+            locktime += 1
+
+        # conflict with parent
+        conflict_unsigned = self.nodes[0].createrawtransaction(inputs=[conflict_utxo], outputs=[{wallet.getnewaddress(): 9.9999}])
+        conflict_signed = wallet.signrawtransactionwithwallet(conflict_unsigned)["hex"]
+        conflict_txid = self.nodes[0].sendrawtransaction(conflict_signed)
+        self.generate(self.nodes[0], 1)
+        assert_equal(wallet.gettransaction(txid=parent_txid)["confirmations"], -1)
+        assert_equal(wallet.gettransaction(txid=child_txid)["confirmations"], -1)
+        assert_equal(wallet.gettransaction(txid=conflict_txid)["confirmations"], 1)
+
+        wallet.migratewallet()
+        assert_equal(wallet.gettransaction(txid=parent_txid)["confirmations"], -1)
+        assert_equal(wallet.gettransaction(txid=child_txid)["confirmations"], -1)
+        assert_equal(wallet.gettransaction(txid=conflict_txid)["confirmations"], 1)
+
+        wallet.unloadwallet()
+
+    def test_hybrid_pubkey(self):
+        self.log.info("Test migration when wallet contains a hybrid pubkey")
+
+        wallet = self.create_legacy_wallet("hybrid_keys")
+
+        # Get the hybrid pubkey for one of the keys in the wallet
+        normal_pubkey = wallet.getaddressinfo(wallet.getnewaddress())["pubkey"]
+        first_byte = bytes.fromhex(normal_pubkey)[0] + 4 # Get the hybrid pubkey first byte
+        parsed_pubkey = ECPubKey()
+        parsed_pubkey.set(bytes.fromhex(normal_pubkey))
+        parsed_pubkey.compressed = False
+        hybrid_pubkey_bytes = bytearray(parsed_pubkey.get_bytes())
+        hybrid_pubkey_bytes[0] = first_byte # Make it hybrid
+        hybrid_pubkey = hybrid_pubkey_bytes.hex()
+
+        # Import the hybrid pubkey
+        wallet.importpubkey(hybrid_pubkey)
+        p2pkh_addr = key_to_p2pkh(hybrid_pubkey)
+        p2pkh_addr_info = wallet.getaddressinfo(p2pkh_addr)
+        assert_equal(p2pkh_addr_info["iswatchonly"], True)
+        assert_equal(p2pkh_addr_info["ismine"], False) # Things involving hybrid pubkeys are not spendable
+
+        # Also import the p2wpkh for the pubkey to make sure we don't migrate it
+        p2wpkh_addr = key_to_p2wpkh(hybrid_pubkey)
+        wallet.importaddress(p2wpkh_addr)
+
+        migrate_info = wallet.migratewallet()
+
+        # Both addresses should only appear in the watchonly wallet
+        p2pkh_addr_info = wallet.getaddressinfo(p2pkh_addr)
+        assert_equal(p2pkh_addr_info["iswatchonly"], False)
+        assert_equal(p2pkh_addr_info["ismine"], False)
+        p2wpkh_addr_info = wallet.getaddressinfo(p2wpkh_addr)
+        assert_equal(p2wpkh_addr_info["iswatchonly"], False)
+        assert_equal(p2wpkh_addr_info["ismine"], False)
+
+        watchonly_wallet = self.nodes[0].get_wallet_rpc(migrate_info["watchonly_name"])
+        watchonly_p2pkh_addr_info = watchonly_wallet.getaddressinfo(p2pkh_addr)
+        assert_equal(watchonly_p2pkh_addr_info["iswatchonly"], False)
+        assert_equal(watchonly_p2pkh_addr_info["ismine"], True)
+        watchonly_p2wpkh_addr_info = watchonly_wallet.getaddressinfo(p2wpkh_addr)
+        assert_equal(watchonly_p2wpkh_addr_info["iswatchonly"], False)
+        assert_equal(watchonly_p2wpkh_addr_info["ismine"], True)
+
+        # There should only be raw or addr descriptors
+        for desc in watchonly_wallet.listdescriptors()["descriptors"]:
+            if desc["desc"].startswith("raw(") or desc["desc"].startswith("addr("):
+                continue
+            assert False, "Hybrid pubkey watchonly wallet has more than just raw() and addr()"
+
+        wallet.unloadwallet()
 
     def run_test(self):
         self.generate(self.nodes[0], 101)
@@ -704,6 +843,8 @@ class WalletMigrationTest(BitcoinTestFramework):
         self.test_direct_file()
         self.test_addressbook()
         self.test_migrate_raw_p2sh()
+        self.test_conflict_txs()
+        self.test_hybrid_pubkey()
 
 if __name__ == '__main__':
     WalletMigrationTest().main()
